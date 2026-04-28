@@ -1,0 +1,13 @@
+# Runtime data (API keys, sessions, history)
+.fair/
+
+# Test artifacts
+test-*.txt
+debug-*.ts
+
+# OS files
+.DS_Store
+
+# Node (just in case)
+node_modules/
+*.log
