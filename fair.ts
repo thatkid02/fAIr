@@ -1,8 +1,30 @@
 #!/usr/bin/env node
 // ═══════════════════════════════════════════════════════════════
 //  FAIR — Fast AI Relay
-//  Single-file coding agent for Bun. Zero dependencies.
-//  Read it. Hack it. Ship it.
+//  Self-Growing Agent Harness with Hot-Reload & Rollback Safety
+//
+//  ARCHITECTURE (for AI readers):
+//    This file (fair.ts) is the MUTABLE harness. It is the runtime
+//    you live in. You may rewrite it to improve your own capabilities.
+//    A stable supervisor (fair-runner.ts) watches this file. When you
+//    edit it, the supervisor validates syntax, runs tests, snapshots
+//    the new version, and hot-reloads the process. If validation
+//    fails, it auto-reverts to the last known good snapshot and
+//    injects the error into your session so you can fix it.
+//
+//  HOT-RELOAD CONTRACT:
+//    - fair-runner.ts spawns you with: bun fair.ts --resume <session>
+//    - On file change it kills → validates → snapshots → restarts
+//    - You auto-save the session after every turn so state survives
+//    - On restart you load the same session and continue seamlessly
+//
+//  SELF-EDIT RULES:
+//    - You may edit fair.ts. Do NOT edit fair-runner.ts.
+//    - The write/edit tools transpile TypeScript before persisting.
+//    - If transpile fails, the tool returns an error immediately.
+//    - If tests fail after a save, the runner reverts and tells you.
+//
+//  Zero dependencies. Bun only.
 // ═══════════════════════════════════════════════════════════════
 
 import * as readline from "readline";
@@ -32,19 +54,24 @@ const DEFAULT_CONFIG: Config = {
 
 let CONFIG: Config = { ...DEFAULT_CONFIG };
 
+let CONFIG_FILE = ".fair/config.json";
+
+export function getConfigFile(): string { return CONFIG_FILE; }
+export function setConfigFile(path: string): void { CONFIG_FILE = path; }
+
 export function setConfig(c: Config): void { CONFIG = c; }
 export function getConfig(): Config { return CONFIG; }
 
 export async function configExists(): Promise<boolean> {
   try {
-    const parsed = JSON.parse(await Bun.file(".fair/config.json").text());
+    const parsed = JSON.parse(await Bun.file(CONFIG_FILE).text());
     return Object.keys(parsed).length > 0;
   } catch { return false; }
 }
 
 export async function loadConfig(): Promise<Config> {
   try {
-    const parsed = JSON.parse(await Bun.file(".fair/config.json").text());
+    const parsed = JSON.parse(await Bun.file(CONFIG_FILE).text());
     return {
       apiKey: parsed.apiKey ?? DEFAULT_CONFIG.apiKey,
       apiBase: parsed.apiBase || DEFAULT_CONFIG.apiBase,
@@ -56,7 +83,7 @@ export async function loadConfig(): Promise<Config> {
 }
 
 export async function saveConfig(c: Config): Promise<void> {
-  await Bun.write(".fair/config.json", JSON.stringify(c, null, 2));
+  await Bun.write(CONFIG_FILE, JSON.stringify(c, null, 2));
 }
 
 export async function configure(c: Config, rl: readline.Interface): Promise<Config> {
@@ -152,6 +179,7 @@ export type StreamChunk =
 const COMMANDS = [
   "/configure", "/config", "/model ", "/budget ",
   "/clear", "/save", "/compact", "/image ", "/help", "/quit",
+  "/changelog", "/log",
 ];
 
 function completer(line: string): [string[], string] {
@@ -266,6 +294,8 @@ function printHelp() {
     ${S.accent}/save${S.reset}            Save session to disk
     ${S.accent}/compact${S.reset}         Summarize old messages
     ${S.accent}/image${S.reset} <path>    Attach image to next prompt
+    ${S.accent}/changelog${S.reset}       Show last 20 tool actions
+    ${S.accent}/log${S.reset}             Alias for /changelog
     ${S.accent}/help${S.reset}            Show this help
     ${S.accent}/quit${S.reset}            Exit
 `);
@@ -291,7 +321,7 @@ function drawStatusBar(messages: Message[], totalCost: number): void {
 
   const left = `${S.muted}${model}${S.reset}`;
   const mid = `${turns}t  ${tokColor}${(tokens / 1000).toFixed(1)}K${S.reset}/${(limit / 1000).toFixed(0)}K`;
-  const right = `${costColor}$${totalCost.toFixed(3)}${S.reset}`;
+  const right = `${costColor}$${totalCost.toFixed(5)}${S.reset}`;
 
   const gaps = cols - stripAnsi(left).length - stripAnsi(mid).length - stripAnsi(right).length;
   const g1 = Math.max(Math.floor(gaps / 2), 1);
@@ -343,6 +373,23 @@ export function calcCost(model: string, inputTokens: number, outputTokens: numbe
 //  Bash blocks rm -rf / and sudo rm for safety.
 // ──────────────────────────────────────────────────────────────
 
+// ── In-Tool Syntax Guard ────────────────────────────────────
+//  Before any write/edit tool persists a .ts file, we transpile
+//  the proposed content with Bun.Transpiler. This gives instant
+//  feedback inside the agent loop without requiring a process
+//  restart. If this passes but tests fail, the runner reverts.
+// ──────────────────────────────────────────────────────────────
+
+function validateTypeScript(code: string): string | null {
+  try {
+    const t = new Bun.Transpiler({ loader: "ts" });
+    t.transformSync(code);
+    return null;
+  } catch (e: any) {
+    return e.message;
+  }
+}
+
 export const TOOLS: Tool[] = [
   {
     name: "read",
@@ -359,8 +406,13 @@ export const TOOLS: Tool[] = [
     parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] },
     async execute(args) {
       const content = String(args.content);
-      await Bun.write(String(args.path), content);
-      return { content: `Wrote ${content.length} bytes to ${args.path}` };
+      const path = String(args.path);
+      if (path.endsWith(".ts") || path.endsWith(".tsx")) {
+        const err = validateTypeScript(content);
+        if (err) return { content: `Syntax error in ${path}: ${err}`, isError: true };
+      }
+      await Bun.write(path, content);
+      return { content: `Wrote ${content.length} bytes to ${path}` };
     },
   },
   {
@@ -371,9 +423,15 @@ export const TOOLS: Tool[] = [
       const oldText = String(args.oldText);
       if (!oldText) return { content: "Error: oldText cannot be empty", isError: true };
       try {
-        const text = await Bun.file(String(args.path)).text();
+        const path = String(args.path);
+        const text = await Bun.file(path).text();
         if (!text.includes(oldText)) return { content: `Error: oldText not found`, isError: true };
-        await Bun.write(String(args.path), text.replace(oldText, String(args.newText)));
+        const newContent = text.replace(oldText, String(args.newText));
+        if (path.endsWith(".ts") || path.endsWith(".tsx")) {
+          const err = validateTypeScript(newContent);
+          if (err) return { content: `Syntax error in ${path}: ${err}`, isError: true };
+        }
+        await Bun.write(path, newContent);
         return { content: "Edited" };
       } catch (e: any) { return { content: `Error: ${e.message}`, isError: true }; }
     },
@@ -591,6 +649,18 @@ export async function loadSession(id: string): Promise<Message[]> {
   } catch { return []; }
 }
 
+export async function findLatestSession(): Promise<string | null> {
+  const glob = new Bun.Glob(".fair/sessions/*.jsonl");
+  const files: { id: string; mtime: Date }[] = [];
+  for await (const file of glob.scan()) {
+    if (file.endsWith(".gitkeep")) continue;
+    const stat = await Bun.file(file).stat();
+    files.push({ id: file.replace(".fair/sessions/", "").replace(".jsonl", ""), mtime: stat.mtime });
+  }
+  files.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+  return files[0]?.id ?? null;
+}
+
 // ──────────────────────────────────────────────────────────────
 //  HISTORY
 //  Persist readline input history to .fair/history.
@@ -722,18 +792,36 @@ async function main() {
   let messages: Message[] = [
     {
       role: "system",
-      content: `cwd: ${process.cwd()}\ntools: read write edit bash\n\nRules:\n- Be concise. Skip grammar.\n- Format in markdown.\n- Code blocks with \`\`\`.\n- Bold with **text**.\n- Inline code with \`code\`.\n- Bullets with - item.\n- Sections with # / ##.`,
+      // SYSTEM PROMPT — NOTE TO AI:
+      // You are running inside fair.ts. You can rewrite this file
+      // to grow your own capabilities. The runner (fair-runner.ts)
+      // handles validation, snapshotting, and rollback. If you break
+      // something, the runner reverts and tells you why. After every
+      // turn your session auto-saves, so hot-reloads are seamless.
+      content: `cwd: ${process.cwd()}\ntools: read write edit bash\n\nRules:\n- Be concise. Skip grammar.\n- Format in markdown.\n- Code blocks with \`\`\`.\n- Bold with **text**.\n- Inline code with \`code\`.\n- Bullets with - item.\n- Sections with # / ##.\n\nYou may edit fair.ts to improve yourself. Do NOT edit fair-runner.ts.\nRead relevant code before editing. Use edit tool for small changes, write for new files. The write/edit tools check TypeScript syntax before saving. Action log persisted to .fair/actions.log — view with /changelog.`,
     },
   ];
   let pendingImages: string[] = [];
   let totalCost = 0;
 
-  if (args[0] === "--resume" && args[1]) {
-    sessionId = args[1];
-    const loaded = await loadSession(sessionId);
-    if (loaded.length) {
-      messages = loaded;
-      console.log(`Resumed session ${sessionId} (${loaded.length} messages)\n`);
+  if (args[0] === "--resume") {
+    if (args[1]) {
+      sessionId = args[1];
+      const loaded = await loadSession(sessionId);
+      if (loaded.length) {
+        messages = loaded;
+        console.log(`Resumed session ${sessionId} (${loaded.length} messages)\n`);
+      }
+    } else {
+      const latest = await findLatestSession();
+      if (latest) {
+        sessionId = latest;
+        const loaded = await loadSession(sessionId);
+        if (loaded.length) {
+          messages = loaded;
+          console.log(`Resumed latest session ${sessionId} (${loaded.length} messages)\n`);
+        }
+      }
     }
   }
 
@@ -754,9 +842,41 @@ async function main() {
   drawStatusBar(messages, totalCost);
   console.log("");
 
+  // Poll for restart requests while idle at the prompt.
+  // If the runner detects a file change, it writes .restart-requested
+  // and waits for us to exit gracefully rather than SIGINTing mid-turn.
+  const restartPoller = setInterval(async () => {
+    try {
+      if (await Bun.file(".fair/.restart-requested").exists()) {
+        clearInterval(restartPoller);
+        try { await Bun.file(".fair/.restart-requested").delete(); } catch {}
+        console.log("\n[fair] code updated — hot-reloading...");
+        rl.close();
+        process.exit(0);
+      }
+    } catch {}
+  }, 500);
+
   while (true) {
-    const input = (await ask(`  ${S.accent}▸${S.reset}  `)).trim();
-    if (!input) continue;
+    // If a restart was requested while we were idle, exit cleanly
+    // so the runner can validate and restart us.
+    try {
+      if (await Bun.file(".fair/.restart-requested").exists()) {
+        clearInterval(restartPoller);
+        try { await Bun.file(".fair/.restart-requested").delete(); } catch {}
+        console.log("\n[fair] code updated — hot-reloading...");
+        break;
+      }
+    } catch {}
+
+    const promptPrefix = `  ${S.accent}▸${S.reset}  `;
+    const input = (await ask(promptPrefix)).trim();
+    if (!input) { continue; }
+    // Clear input line so next content starts clean
+    readline.moveCursor(process.stdout, -200, 0);
+    process.stdout.write("\x1b[2K");
+    const blueLine = S.accent + "─".repeat(getTermWidth()) + S.reset;
+    console.log("\r  " + blueLine);
 
     if (input === "/quit" || input === "/q") break;
 
@@ -843,7 +963,22 @@ async function main() {
     try {
       const result = await runTurn(messages);
       totalCost += result.cost;
+      // Auto-persist so the session survives hot-reloads triggered
+      // by self-edits. The runner always passes --resume <session>
+      // on restart, so this keeps continuity across reinstantiations.
+      await saveSession(sessionId, messages);
       process.stdout.write("\n");
+
+      // If the runner requested a restart after we edited ourselves,
+      // exit cleanly now so the current LLM output is preserved.
+      try {
+        if (await Bun.file(".fair/.restart-requested").exists()) {
+          clearInterval(restartPoller);
+          try { await Bun.file(".fair/.restart-requested").delete(); } catch {}
+          console.log("\n[fair] code updated — hot-reloading...");
+          break;
+        }
+      } catch {}
     } catch (e: any) {
       printError(e.message);
     }
@@ -851,10 +986,13 @@ async function main() {
     drawStatusBar(messages, totalCost);
   }
 
+  clearInterval(restartPoller);
+
   rl.close();
   await saveSession(sessionId, messages);
   await saveHistory(rl.history);
   console.log("Goodbye.");
+  process.exit(0);
 }
 
 if (import.meta.main) {

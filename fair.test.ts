@@ -47,6 +47,7 @@ function getOutput(): string {
 
 beforeEach(() => {
   originalFetch = globalThis.fetch;
+  fair.setConfigFile(".fair/test-config.json");
   fair.setConfig({
     apiKey: "test-key",
     apiBase: "https://api.openai.com/v1",
@@ -58,6 +59,7 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  fair.setConfigFile(".fair/config.json");
   fair.setConfig({
     apiKey: "test-key",
     apiBase: "https://api.openai.com/v1",
@@ -65,7 +67,7 @@ afterEach(() => {
     budget: 10,
     contextLimit: 128000,
   });
-  try { unlinkSync(".fair/config.json") } catch {}
+  try { unlinkSync(".fair/test-config.json") } catch {}
   try { unlinkSync(".fair/sessions/test-session.jsonl") } catch {}
   try { unlinkSync(".fair/history") } catch {}
   restoreStdout();
@@ -223,14 +225,14 @@ describe("config", () => {
   });
 
   test("loadConfig normalizes null budget to default", async () => {
-    await Bun.write(".fair/config.json", JSON.stringify({ apiKey: "sk-test", budget: null }));
+    await Bun.write(fair.getConfigFile(), JSON.stringify({ apiKey: "sk-test", budget: null }));
     const loaded = await fair.loadConfig();
     expect(loaded.apiKey).toBe("sk-test");
     expect(loaded.budget).toBe(10);
   });
 
   test("loadConfig normalizes NaN contextLimit to default", async () => {
-    await Bun.write(".fair/config.json", JSON.stringify({ apiKey: "sk-test", contextLimit: NaN }));
+    await Bun.write(fair.getConfigFile(), JSON.stringify({ apiKey: "sk-test", contextLimit: NaN }));
     const loaded = await fair.loadConfig();
     expect(loaded.apiKey).toBe("sk-test");
     expect(loaded.contextLimit).toBe(128000);
