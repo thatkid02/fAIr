@@ -31,20 +31,23 @@ const DEFAULT_CONFIG: Config = {
 };
 
 let CONFIG: Config = { ...DEFAULT_CONFIG };
+let CONFIG_FILE = ".fair/config.json";
 
 export function setConfig(c: Config): void { CONFIG = c; }
 export function getConfig(): Config { return CONFIG; }
+export function getConfigFile(): string { return CONFIG_FILE; }
+export function setConfigFile(path: string): void { CONFIG_FILE = path; }
 
 export async function configExists(): Promise<boolean> {
   try {
-    const parsed = JSON.parse(await Bun.file(".fair/config.json").text());
+    const parsed = JSON.parse(await Bun.file(CONFIG_FILE).text());
     return Object.keys(parsed).length > 0;
   } catch { return false; }
 }
 
 export async function loadConfig(): Promise<Config> {
   try {
-    const parsed = JSON.parse(await Bun.file(".fair/config.json").text());
+    const parsed = JSON.parse(await Bun.file(CONFIG_FILE).text());
     return {
       apiKey: parsed.apiKey ?? DEFAULT_CONFIG.apiKey,
       apiBase: parsed.apiBase || DEFAULT_CONFIG.apiBase,
@@ -56,7 +59,18 @@ export async function loadConfig(): Promise<Config> {
 }
 
 export async function saveConfig(c: Config): Promise<void> {
-  await Bun.write(".fair/config.json", JSON.stringify(c, null, 2));
+  await Bun.write(CONFIG_FILE, JSON.stringify(c, null, 2));
+}
+
+function isReasoningModel(model: string): boolean {
+  const id = model.toLowerCase();
+  return (
+    id.startsWith("o1") ||
+    id.startsWith("o3") ||
+    id.startsWith("o4") ||
+    id.includes("reasoning") ||
+    id.includes("-think-")
+  );
 }
 
 export async function configure(c: Config, rl: readline.Interface): Promise<Config> {
@@ -338,7 +352,7 @@ export function calcCost(model: string, inputTokens: number, outputTokens: numbe
 
 // ──────────────────────────────────────────────────────────────
 //  TOOLS
-//  Four built-in tools: read, write, edit, bash.
+//  Five built-in tools: read, write, edit, bash, fallow.
 //  Each is a JSON Schema + async execute function.
 //  Bash blocks rm -rf / and sudo rm for safety.
 // ──────────────────────────────────────────────────────────────
@@ -414,6 +428,42 @@ export const TOOLS: Tool[] = [
       return { content: [stdout, stderr].filter(Boolean).join("\n").trim() || "(no output)", isError: !ok };
     },
   },
+  {
+    name: "fallow",
+    description:
+      "Run fallow codebase intelligence on the current project. " +
+      "Requires fallow to be installed (bun add -d fallow) or available via bunx. " +
+      "Commands: summary (overview), dead-code, dupes, health, audit (changed files), fix (cleanup). " +
+      "Always prefer --format json.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          enum: ["summary", "dead-code", "dupes", "health", "audit", "fix"],
+          description: "Fallow subcommand",
+        },
+        extra: {
+          type: "string",
+          description: "Additional flags, e.g. --dry-run",
+        },
+      },
+      required: ["command"],
+    },
+    async execute(args) {
+      const cmd = String(args.command);
+      const extra = args.extra ? ` ${String(args.extra)}` : "";
+      const proc = Bun.spawn(
+        ["bash", "-c", `bunx fallow ${cmd} --format json${extra}`],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      const exit = await proc.exited;
+      const out = stdout || stderr || "(no output)";
+      return { content: out.slice(0, 8000), isError: exit !== 0 };
+    },
+  },
 ];
 
 // ──────────────────────────────────────────────────────────────
@@ -425,6 +475,7 @@ export const TOOLS: Tool[] = [
 // ──────────────────────────────────────────────────────────────
 
 export function formatMessagesForAPI(messages: Message[]): unknown[] {
+  const reasoning = isReasoningModel(getConfig().model);
   return messages.map((m) => {
     // User with images → content array (text + image_url blocks)
     if (m.role === "user" && m.images?.length) {
@@ -441,17 +492,18 @@ export function formatMessagesForAPI(messages: Message[]): unknown[] {
     if (m.role === "assistant") {
       const base: any = { role: "assistant" };
 
-      // Reasoning models: empty content must be "" not null.
-      // Tool-only messages: OpenAI convention is null.
-      if (m.content || m.reasoning_content !== undefined) {
-        base.content = m.content ?? "";
-      } else if (m.toolCalls?.length) {
-        base.content = null;
-      } else {
-        base.content = m.content ?? null;
-      }
+      // Never send null content — reasoning models and some providers reject it.
+      // Empty string is the safe default for all cases.
+      base.content = m.content ?? "";
 
       if (m.reasoning_content !== undefined) base.reasoning_content = m.reasoning_content;
+
+      // Some reasoning-model providers require reasoning_content field to be present
+      // even when empty (e.g. DeepSeek, some OpenAI-compatible proxies).
+      if (reasoning && base.reasoning_content === undefined) {
+        base.reasoning_content = "";
+      }
+
       if (m.toolCalls?.length) {
         base.tool_calls = m.toolCalls.map((tc) => ({
           id: tc.id,
@@ -468,7 +520,9 @@ export function formatMessagesForAPI(messages: Message[]): unknown[] {
     }
 
     // System / plain user
-    return { role: m.role, content: m.content || "" };
+    // Reasoning models (o1, o3, …) use "developer" instead of "system".
+    const role = m.role === "system" && reasoning ? "developer" : m.role;
+    return { role, content: m.content || "" };
   });
 }
 
@@ -564,10 +618,17 @@ export async function compactSession(messages: Message[]): Promise<Message[]> {
   };
 
   const cfg = getConfig();
+  const body: any = { model: cfg.model, messages: formatMessagesForAPI([summaryPrompt]) };
+  // Reasoning models use max_completion_tokens instead of max_tokens
+  if (isReasoningModel(cfg.model)) {
+    body.max_completion_tokens = 500;
+  } else {
+    body.max_tokens = 500;
+  }
   const res = await fetch(`${cfg.apiBase}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: cfg.model, messages: formatMessagesForAPI([summaryPrompt]), max_tokens: 500 }),
+    body: JSON.stringify(body),
   });
 
   const summary = (await res.json()).choices?.[0]?.message?.content || "Previous conversation context.";
@@ -722,7 +783,7 @@ async function main() {
   let messages: Message[] = [
     {
       role: "system",
-      content: `cwd: ${process.cwd()}\ntools: read write edit bash\n\nRules:\n- Be concise. Skip grammar.\n- Format in markdown.\n- Code blocks with \`\`\`.\n- Bold with **text**.\n- Inline code with \`code\`.\n- Bullets with - item.\n- Sections with # / ##.`,
+      content: `cwd: ${process.cwd()}\ntools: read write edit bash fallow\n\nRules:\n- Be concise. Skip grammar.\n- Format in markdown.\n- Code blocks with \`\`\`.\n- Bold with **text**.\n- Inline code with \`code\`.\n- Bullets with - item.\n- Sections with # / ##.\n- Use fallow before large refactors to understand dead code, duplication, and complexity.\n- Use fallow audit after changes to catch regressions.`,
     },
   ];
   let pendingImages: string[] = [];

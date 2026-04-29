@@ -47,6 +47,7 @@ function getOutput(): string {
 
 beforeEach(() => {
   originalFetch = globalThis.fetch;
+  fair.setConfigFile(".fair/test-config.json");
   fair.setConfig({
     apiKey: "test-key",
     apiBase: "https://api.openai.com/v1",
@@ -58,6 +59,7 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  fair.setConfigFile(".fair/config.json");
   fair.setConfig({
     apiKey: "test-key",
     apiBase: "https://api.openai.com/v1",
@@ -65,7 +67,7 @@ afterEach(() => {
     budget: 10,
     contextLimit: 128000,
   });
-  try { unlinkSync(".fair/config.json") } catch {}
+  try { unlinkSync(".fair/test-config.json") } catch {}
   try { unlinkSync(".fair/sessions/test-session.jsonl") } catch {}
   try { unlinkSync(".fair/history") } catch {}
   restoreStdout();
@@ -223,14 +225,14 @@ describe("config", () => {
   });
 
   test("loadConfig normalizes null budget to default", async () => {
-    await Bun.write(".fair/config.json", JSON.stringify({ apiKey: "sk-test", budget: null }));
+    await Bun.write(".fair/test-config.json", JSON.stringify({ apiKey: "sk-test", budget: null }));
     const loaded = await fair.loadConfig();
     expect(loaded.apiKey).toBe("sk-test");
     expect(loaded.budget).toBe(10);
   });
 
   test("loadConfig normalizes NaN contextLimit to default", async () => {
-    await Bun.write(".fair/config.json", JSON.stringify({ apiKey: "sk-test", contextLimit: NaN }));
+    await Bun.write(".fair/test-config.json", JSON.stringify({ apiKey: "sk-test", contextLimit: NaN }));
     const loaded = await fair.loadConfig();
     expect(loaded.apiKey).toBe("sk-test");
     expect(loaded.contextLimit).toBe(128000);
@@ -440,7 +442,7 @@ describe("formatMessagesForAPI", () => {
     expect(formatted[0].reasoning_content).toBe("Let me think step by step...");
   });
 
-  test("formats assistant with null content and tool calls", () => {
+  test("formats assistant with empty content and tool calls", () => {
     const messages: Message[] = [
       {
         role: "assistant",
@@ -449,7 +451,7 @@ describe("formatMessagesForAPI", () => {
       },
     ];
     const formatted = fair.formatMessagesForAPI(messages);
-    expect(formatted[0].content).toBeNull();
+    expect(formatted[0].content).toBe("");
   });
 
   test("formats tool result", () => {
@@ -468,6 +470,51 @@ describe("formatMessagesForAPI", () => {
     const messages: Message[] = [{ role: "user", content: "" }];
     const formatted = fair.formatMessagesForAPI(messages);
     expect(formatted[0].content).toBe("");
+  });
+
+  test("system role becomes developer for reasoning models", () => {
+    fair.setConfig({ ...fair.getConfig(), model: "o3-mini" });
+    const messages: Message[] = [
+      { role: "system", content: "You are a helpful assistant." },
+      { role: "user", content: "hi" },
+    ];
+    const formatted = fair.formatMessagesForAPI(messages);
+    expect(formatted[0].role).toBe("developer");
+    expect(formatted[1].role).toBe("user");
+  });
+
+  test("system role stays system for non-reasoning models", () => {
+    fair.setConfig({ ...fair.getConfig(), model: "gpt-4o" });
+    const messages: Message[] = [
+      { role: "system", content: "You are a helpful assistant." },
+      { role: "user", content: "hi" },
+    ];
+    const formatted = fair.formatMessagesForAPI(messages);
+    expect(formatted[0].role).toBe("system");
+  });
+
+  test("reasoning model assistant gets empty reasoning_content", () => {
+    fair.setConfig({ ...fair.getConfig(), model: "o1-mini" });
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: "Hello",
+      },
+    ];
+    const formatted = fair.formatMessagesForAPI(messages);
+    expect(formatted[0].reasoning_content).toBe("");
+  });
+
+  test("non-reasoning model assistant does not get reasoning_content", () => {
+    fair.setConfig({ ...fair.getConfig(), model: "gpt-4o" });
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: "Hello",
+      },
+    ];
+    const formatted = fair.formatMessagesForAPI(messages);
+    expect(formatted[0].reasoning_content).toBeUndefined();
   });
 });
 
