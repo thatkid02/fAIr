@@ -350,11 +350,16 @@ export function calcCost(model: string, inputTokens: number, outputTokens: numbe
   return (inputTokens * p.input + outputTokens * p.output) / 1_000_000;
 }
 
+function isBackgroundCommand(cmd: string): boolean {
+  return cmd.trimEnd().endsWith("&");
+}
+
 // ──────────────────────────────────────────────────────────────
 //  TOOLS
 //  Five built-in tools: read, write, edit, bash, fallow.
 //  Each is a JSON Schema + async execute function.
 //  Bash blocks rm -rf / and sudo rm for safety.
+//  Background commands (ending with &) skip the kill timeout.
 // ──────────────────────────────────────────────────────────────
 
 export const TOOLS: Tool[] = [
@@ -394,21 +399,48 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "bash",
-    description: "Execute a shell command. Be careful with destructive ops.",
+    description: "Execute a shell command. Be careful with destructive ops. " +
+      "Commands ending with & run in the background (no timeout). " +
+      "Default timeout is 60s for foreground commands.",
     parameters: { type: "object", properties: { command: { type: "string" }, timeout: { type: "number" } }, required: ["command"] },
     async execute(args) {
       const cmd = String(args.command);
-      const timeout = Number(args.timeout ?? 60000);
+      const isBackground = isBackgroundCommand(cmd);
+      const timeout = isBackground ? 0 : Number(args.timeout ?? 60000);
       if (cmd.includes("rm -rf /") || cmd.includes("sudo rm")) {
         return { content: "Blocked: dangerous command", isError: true };
       }
 
-      process.stdout.write(`${S.accent}[bash]${S.reset} ${S.text}${cmd}${S.reset}\n`);
+      process.stdout.write(`${S.accent}[bash${isBackground ? " bg" : ""}]${S.reset} ${S.text}${cmd}${S.reset}\n`);
       const proc = Bun.spawn(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
-      const timer = setTimeout(() => proc.kill(), timeout);
+      const timer = timeout > 0 ? setTimeout(() => proc.kill(), timeout) : null;
 
       let stdout = "";
       const reader = proc.stdout.getReader();
+
+      if (isBackground) {
+        // Background processes inherit pipes and keep them open.
+        // Cancel the reader after a short grace period so we don't hang.
+        const bgTimer = setTimeout(() => reader.cancel(), 800);
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = new TextDecoder().decode(value);
+            stdout += chunk;
+            for (const line of chunk.split("\n").filter((l) => l.trim()).slice(0, 3)) {
+              process.stdout.write(`${S.muted}  │ ${line}${S.reset}\n`);
+            }
+          }
+        } catch {
+          // Reader was cancelled — background process still running
+        }
+        clearTimeout(bgTimer);
+        if (timer) clearTimeout(timer);
+        process.stdout.write(`  ${S.success}✓${S.reset}  background started\n`);
+        return { content: stdout.trim() || "(background process started)", isError: false };
+      }
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -420,7 +452,7 @@ export const TOOLS: Tool[] = [
       }
 
       const stderr = await new Response(proc.stderr).text();
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       const exitCode = await proc.exited;
       const ok = exitCode === 0;
 
