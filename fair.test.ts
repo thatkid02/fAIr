@@ -378,6 +378,23 @@ describe("tools", () => {
     expect(elapsed).toBeLessThan(2000);
     expect(result.isError).toBe(true);
   });
+
+  test("bash background command skips timeout and returns quickly", async () => {
+    const tool = fair.TOOLS.find((t) => t.name === "bash")!;
+    const start = Date.now();
+    const result = await tool.execute({ command: "sleep 10 &" });
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(2000);
+    expect(result.isError).toBe(false);
+    expect(result.content).toContain("background");
+  });
+
+  test("bash background command returns stdout from short-lived bg proc", async () => {
+    const tool = fair.TOOLS.find((t) => t.name === "bash")!;
+    const result = await tool.execute({ command: "echo hello-bg &" });
+    expect(result.isError).toBe(false);
+    expect(result.content).toContain("hello-bg");
+  });
 });
 
 // ── Provider ─────────────────────────────────────────────────
@@ -428,7 +445,7 @@ describe("formatMessagesForAPI", () => {
     expect(formatted[0].tool_calls[0].function.arguments).toBe('{"path":"x"}');
   });
 
-  test("formats assistant with reasoning_content", () => {
+  test("strips reasoning_content from outbound assistant messages", () => {
     const messages: Message[] = [
       {
         role: "assistant",
@@ -439,7 +456,7 @@ describe("formatMessagesForAPI", () => {
     const formatted = fair.formatMessagesForAPI(messages);
     expect(formatted[0].role).toBe("assistant");
     expect(formatted[0].content).toBe("The answer is 42");
-    expect(formatted[0].reasoning_content).toBe("Let me think step by step...");
+    expect(formatted[0].reasoning_content).toBeUndefined();
   });
 
   test("formats assistant with empty content and tool calls", () => {
@@ -493,7 +510,7 @@ describe("formatMessagesForAPI", () => {
     expect(formatted[0].role).toBe("system");
   });
 
-  test("reasoning model assistant gets empty reasoning_content", () => {
+  test("reasoning model assistant does not inject empty reasoning_content", () => {
     fair.setConfig({ ...fair.getConfig(), model: "o1-mini" });
     const messages: Message[] = [
       {
@@ -502,7 +519,7 @@ describe("formatMessagesForAPI", () => {
       },
     ];
     const formatted = fair.formatMessagesForAPI(messages);
-    expect(formatted[0].reasoning_content).toBe("");
+    expect(formatted[0].reasoning_content).toBeUndefined();
   });
 
   test("non-reasoning model assistant does not get reasoning_content", () => {
