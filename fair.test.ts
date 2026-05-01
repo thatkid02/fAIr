@@ -445,7 +445,23 @@ describe("formatMessagesForAPI", () => {
     expect(formatted[0].tool_calls[0].function.arguments).toBe('{"path":"x"}');
   });
 
-  test("strips reasoning_content from outbound assistant messages", () => {
+  test("includes reasoning_content in outbound assistant messages for non-reasoning models", () => {
+    fair.setConfig({ ...fair.getConfig(), model: "gpt-4o" });
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: "The answer is 42",
+        reasoning_content: "Let me think step by step...",
+      },
+    ];
+    const formatted = fair.formatMessagesForAPI(messages);
+    expect(formatted[0].role).toBe("assistant");
+    expect(formatted[0].content).toBe("The answer is 42");
+    expect(formatted[0].reasoning_content).toBe("Let me think step by step...");
+  });
+
+  test("strips reasoning_content from outbound assistant messages for reasoning models", () => {
+    fair.setConfig({ ...fair.getConfig(), model: "o1-mini" });
     const messages: Message[] = [
       {
         role: "assistant",

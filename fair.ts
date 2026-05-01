@@ -529,8 +529,12 @@ export function formatMessagesForAPI(messages: Message[]): unknown[] {
       // Empty string is the safe default for all cases.
       base.content = m.content ?? "";
 
-      // NOTE: reasoning_content is kept internally but NEVER sent back to the API.
-      // Some providers (e.g. DeepSeek) return 400 if reasoning_content is echoed.
+      // Include reasoning_content in the API payload when it exists.
+      // Thinking-mode providers require it to be echoed back on multi-turn.
+      // Dedicated reasoning models (names containing "reasoner") strip it instead.
+      if (m.reasoning_content !== undefined && !reasoning) {
+        base.reasoning_content = m.reasoning_content;
+      }
 
       if (m.toolCalls?.length) {
         base.tool_calls = m.toolCalls.map((tc) => ({
