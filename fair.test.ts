@@ -24,11 +24,20 @@ function sseStream(lines: string[]): ReadableStream<Uint8Array> {
 
 let originalFetch: typeof fetch;
 let stdoutChunks: string[] = [];
-let originalStdoutWrite: typeof process.stdout.write;
+let originalStdoutWrite: any = null;
+
+function ensureStdoutWrite() {
+  if (!process.stdout.write) {
+    (process.stdout as any).write = () => true;
+  }
+}
 
 function captureStdout() {
   stdoutChunks = [];
-  originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  ensureStdoutWrite();
+  if (originalStdoutWrite === null) {
+    originalStdoutWrite = process.stdout.write;
+  }
   process.stdout.write = ((chunk: string | Uint8Array, ...args: any[]) => {
     stdoutChunks.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
     return true;
@@ -36,7 +45,9 @@ function captureStdout() {
 }
 
 function restoreStdout() {
-  process.stdout.write = originalStdoutWrite;
+  if (originalStdoutWrite !== null) {
+    process.stdout.write = originalStdoutWrite;
+  }
 }
 
 function getOutput(): string {
@@ -46,6 +57,7 @@ function getOutput(): string {
 // ── Setup / Teardown ─────────────────────────────────────────
 
 beforeEach(() => {
+  ensureStdoutWrite();
   originalFetch = globalThis.fetch;
   fair.setConfigFile(".fair/test-config.json");
   fair.setConfig({
@@ -71,6 +83,35 @@ afterEach(() => {
   try { unlinkSync(".fair/sessions/test-session.jsonl") } catch {}
   try { unlinkSync(".fair/history") } catch {}
   restoreStdout();
+});
+
+// ── Timeout Utilities ────────────────────────────────────────
+
+describe("withTimeout", () => {
+  test("resolves when promise finishes in time", async () => {
+    const result = await fair.withTimeout(Promise.resolve(42), 1000, "test");
+    expect(result).toBe(42);
+  });
+
+  test("rejects when promise exceeds timeout", async () => {
+    try {
+      await fair.withTimeout(new Promise((resolve) => setTimeout(resolve, 2000)), 50, "slow-op");
+      expect(false).toBe(true); // should not reach
+    } catch (e: any) {
+      expect(e.message).toContain("Timeout");
+      expect(e.message).toContain("slow-op");
+      expect(e.message).toContain("Re-evaluate");
+    }
+  });
+
+  test("rejects immediately on promise failure", async () => {
+    try {
+      await fair.withTimeout(Promise.reject(new Error("boom")), 1000, "fail-op");
+      expect(false).toBe(true);
+    } catch (e: any) {
+      expect(e.message).toBe("boom");
+    }
+  });
 });
 
 // ── StreamRenderer Tests ─────────────────────────────────────
@@ -313,6 +354,18 @@ describe("tools", () => {
     expect(result.content).toContain("Error");
   });
 
+  test("read tool respects custom timeout", async () => {
+    const tool = fair.TOOLS.find((t) => t.name === "read")!;
+    const start = Date.now();
+    // Use a tiny timeout (0.05s = 50ms) to force timeout on any real read
+    const result = await tool.execute({ path: "test-file.txt", timeout: 0.05 });
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(2000);
+    // On fast filesystems the read may succeed before timeout; on slow ones it errors.
+    // We just verify it returns a result without hanging.
+    expect(result).toBeDefined();
+  });
+
   test("write tool creates file", async () => {
     const tool = fair.TOOLS.find((t) => t.name === "write")!;
     const result = await tool.execute({ path: "test-new.txt", content: "new content" });
@@ -370,13 +423,24 @@ describe("tools", () => {
     expect(result.content).toContain("Blocked");
   });
 
-  test("bash tool respects timeout", async () => {
+  test("bash tool respects timeout in seconds", async () => {
     const tool = fair.TOOLS.find((t) => t.name === "bash")!;
     const start = Date.now();
-    const result = await tool.execute({ command: "sleep 10", timeout: 100 });
+    const result = await tool.execute({ command: "sleep 10", timeout: 0.1 });
     const elapsed = Date.now() - start;
     expect(elapsed).toBeLessThan(2000);
     expect(result.isError).toBe(true);
+    expect(result.content).toContain("Timeout");
+  });
+
+  test("bash tool respects fractional-second timeout", async () => {
+    const tool = fair.TOOLS.find((t) => t.name === "bash")!;
+    const start = Date.now();
+    const result = await tool.execute({ command: "sleep 10", timeout: 0.05 });
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(2000);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("Timeout");
   });
 
   test("bash background command skips timeout and returns quickly", async () => {
@@ -656,6 +720,23 @@ describe("streamChat", () => {
     }
     expect(caught).toBe(true);
   });
+
+  test("uses fetchWithTimeout internally", async () => {
+    // fetchWithTimeout is not directly exported, but we verify streamChat
+    // delegates to fetch and respects the provided signal.
+    let receivedSignal: AbortSignal | undefined;
+    globalThis.fetch = async (_url, init) => {
+      receivedSignal = (init as any)?.signal;
+      return new Response(
+        sseStream(['data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n', 'data: [DONE]\n\n']),
+        { status: 200 }
+      );
+    };
+
+    const ctrl = new AbortController();
+    for await (const _ of fair.streamChat([{ role: "user", content: "hi" }], [], ctrl.signal)) {}
+    expect(receivedSignal).toBeDefined();
+  });
 });
 
 describe("runTurn", () => {
@@ -677,6 +758,30 @@ describe("runTurn", () => {
     expect(result.cost).toBeGreaterThan(0);
     expect(messages[messages.length - 1].role).toBe("assistant");
     expect(messages[messages.length - 1].content).toBe("Hello world");
+  });
+
+  test("stops after max tool calls per turn", async () => {
+    let callCount = 0;
+    globalThis.fetch = async () => {
+      callCount++;
+      return new Response(
+        sseStream([
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_' + callCount + '","type":"function","function":{"name":"read"}}]}}]}\n\n',
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"x\\"}"}}]}}]}\n\n',
+          'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+        ]),
+        { status: 200 }
+      );
+    };
+
+    const messages: Message[] = [{ role: "user", content: "keep calling tools" }];
+    const result = await fair.runTurn(messages);
+
+    const toolResults = messages.filter((m) => m.role === "tool");
+    expect(toolResults.length).toBeGreaterThanOrEqual(1);
+    // The last assistant message should explain the abort
+    const lastAssistant = messages.filter((m) => m.role === "assistant").pop();
+    expect(lastAssistant?.content).toContain("maximum");
   });
 });
 

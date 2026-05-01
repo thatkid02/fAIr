@@ -120,6 +120,45 @@ export async function configure(c: Config, rl: readline.Interface): Promise<Conf
 }
 
 // ──────────────────────────────────────────────────────────────
+//  TIMEOUT & SAFETY
+//  Every operation that can hang must have a ceiling.
+//  When a timeout fires, the AI receives an actionable error so
+//  it can re-evaluate: shorten the command, use background mode,
+//  break work into smaller chunks, or increase timeout.
+// ──────────────────────────────────────────────────────────────
+
+const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
+const MAX_TOOL_CALLS_PER_TURN = 20;
+const STREAM_TIMEOUT_MS = 120_000;
+const TURN_TIMEOUT_MS = 300_000;
+const COMPACT_TIMEOUT_MS = 60_000;
+
+function timeoutError(label: string, ms: number, hint?: string): ToolResult {
+  const seconds = (ms / 1000).toFixed(0);
+  let msg = `Timeout: '${label}' exceeded ${seconds}s and was aborted.`;
+  if (hint) msg += ` ${hint}`;
+  msg += " Re-evaluate your approach: use a shorter command, break the task into smaller steps, run in background with '&', or explicitly request a higher timeout.";
+  return { content: msg, isError: true };
+}
+
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string, hint?: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutError(label, ms, hint).content));
+    }, ms);
+    promise
+      .then((val) => { clearTimeout(timer); resolve(val); })
+      .catch((err) => { clearTimeout(timer); reject(err); });
+  });
+}
+
+function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+// ──────────────────────────────────────────────────────────────
 //  TYPES
 //  Core data structures: messages, tools, streaming chunks.
 // ──────────────────────────────────────────────────────────────
@@ -252,6 +291,7 @@ function printWelcome() {
 
 function printToolCall(name: string, args: Record<string, unknown>) {
   const argsStr = Object.entries(args)
+    .filter(([k]) => k !== "timeout")
     .map(([k, v]) => `${S.muted}${k}${S.reset}=${S.text}${JSON.stringify(v)}${S.reset}`)
     .join(" ");
   console.log(`\n  ${S.accent}${name}${S.reset}  ${argsStr}`);
@@ -355,10 +395,21 @@ function isBackgroundCommand(cmd: string): boolean {
   return cmd.trimEnd().endsWith("&");
 }
 
+function getTimeoutMs(args: Record<string, unknown>, defaultMs: number): number {
+  const raw = args.timeout;
+  if (typeof raw === "number" && !isNaN(raw) && raw > 0) {
+    // AI can specify timeout in seconds or milliseconds. If < 1000, treat as seconds.
+    return raw < 1000 ? Math.round(raw * 1000) : Math.round(raw);
+  }
+  return defaultMs;
+}
+
 // ──────────────────────────────────────────────────────────────
 //  TOOLS
 //  Five built-in tools: read, write, edit, bash, fallow.
-//  Each is a JSON Schema + async execute function.
+//  Every tool accepts an optional 'timeout' arg (seconds or ms).
+//  If a tool hangs, it aborts and returns an error so the AI can
+//  re-evaluate: shorter command, background mode, smaller work.
 //  Bash blocks rm -rf / and sudo rm for safety.
 //  Background commands (ending with &) skip the kill timeout.
 // ──────────────────────────────────────────────────────────────
@@ -366,62 +417,125 @@ function isBackgroundCommand(cmd: string): boolean {
 export const TOOLS: Tool[] = [
   {
     name: "read",
-    description: "Read file. Use before edit.",
-    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    description: "Read a file. Use before edit. Optional timeout (default 30s).",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        timeout: { type: "number", description: "Timeout in seconds (default 30)" },
+      },
+      required: ["path"],
+    },
     async execute(args) {
-      try { return { content: await Bun.file(String(args.path)).text() }; }
-      catch (e: any) { return { content: `Error: ${e.message}`, isError: true }; }
+      const ms = getTimeoutMs(args, 30_000);
+      try {
+        const content = await withTimeout(
+          Bun.file(String(args.path)).text(),
+          ms,
+          `read ${args.path}`,
+          "The file may be very large or on a slow filesystem."
+        );
+        return { content };
+      } catch (e: any) {
+        return { content: `Error: ${e.message}`, isError: true };
+      }
     },
   },
   {
     name: "write",
-    description: "Write content to a file. Creates or overwrites.",
-    parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] },
+    description: "Write content to a file. Creates or overwrites. Optional timeout (default 30s).",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" },
+        timeout: { type: "number", description: "Timeout in seconds (default 30)" },
+      },
+      required: ["path", "content"],
+    },
     async execute(args) {
+      const ms = getTimeoutMs(args, 30_000);
       const content = String(args.content);
-      await Bun.write(String(args.path), content);
-      return { content: `Wrote ${content.length} bytes to ${args.path}` };
+      try {
+        await withTimeout(
+          Bun.write(String(args.path), content),
+          ms,
+          `write ${args.path}`,
+          "The target filesystem may be slow or full."
+        );
+        return { content: `Wrote ${content.length} bytes to ${args.path}` };
+      } catch (e: any) {
+        return { content: `Error: ${e.message}`, isError: true };
+      }
     },
   },
   {
     name: "edit",
-    description: "Replace exact text in a file (first occurrence only).",
-    parameters: { type: "object", properties: { path: { type: "string" }, oldText: { type: "string" }, newText: { type: "string" } }, required: ["path", "oldText", "newText"] },
+    description: "Replace exact text in a file (first occurrence only). Optional timeout (default 30s).",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        oldText: { type: "string" },
+        newText: { type: "string" },
+        timeout: { type: "number", description: "Timeout in seconds (default 30)" },
+      },
+      required: ["path", "oldText", "newText"],
+    },
     async execute(args) {
+      const ms = getTimeoutMs(args, 30_000);
       const oldText = String(args.oldText);
       if (!oldText) return { content: "Error: oldText cannot be empty", isError: true };
       try {
-        const text = await Bun.file(String(args.path)).text();
+        const text = await withTimeout(
+          Bun.file(String(args.path)).text(),
+          ms,
+          `read for edit ${args.path}`
+        );
         if (!text.includes(oldText)) return { content: `Error: oldText not found`, isError: true };
-        await Bun.write(String(args.path), text.replace(oldText, String(args.newText)));
+        await withTimeout(
+          Bun.write(String(args.path), text.replace(oldText, String(args.newText))),
+          ms,
+          `write after edit ${args.path}`
+        );
         return { content: "Edited" };
-      } catch (e: any) { return { content: `Error: ${e.message}`, isError: true }; }
+      } catch (e: any) {
+        return { content: `Error: ${e.message}`, isError: true };
+      }
     },
   },
   {
     name: "bash",
     description: "Execute a shell command. Be careful with destructive ops. " +
       "Commands ending with & run in the background (no timeout). " +
-      "Default timeout is 60s for foreground commands.",
-    parameters: { type: "object", properties: { command: { type: "string" }, timeout: { type: "number" } }, required: ["command"] },
+      "Default timeout is 60s for foreground commands. " +
+      "You may override timeout via the timeout arg (seconds or ms).",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        timeout: { type: "number", description: "Timeout in seconds (default 60) or milliseconds if >= 1000" },
+      },
+      required: ["command"],
+    },
     async execute(args) {
       const cmd = String(args.command);
       const isBackground = isBackgroundCommand(cmd);
-      const timeout = isBackground ? 0 : Number(args.timeout ?? 60000);
+      const ms = isBackground ? 0 : getTimeoutMs(args, 60_000);
       if (cmd.includes("rm -rf /") || cmd.includes("sudo rm")) {
         return { content: "Blocked: dangerous command", isError: true };
       }
 
       process.stdout.write(`${S.accent}[bash${isBackground ? " bg" : ""}]${S.reset} ${S.text}${cmd}${S.reset}\n`);
+
       const proc = Bun.spawn(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" });
-      const timer = timeout > 0 ? setTimeout(() => proc.kill(), timeout) : null;
+      let timedOut = false;
+      const timer = ms > 0 ? setTimeout(() => { timedOut = true; proc.kill(); }, ms) : null;
 
       let stdout = "";
       const reader = proc.stdout.getReader();
 
       if (isBackground) {
-        // Background processes inherit pipes and keep them open.
-        // Cancel the reader after a short grace period so we don't hang.
         const bgTimer = setTimeout(() => reader.cancel(), 800);
         try {
           while (true) {
@@ -442,21 +556,30 @@ export const TOOLS: Tool[] = [
         return { content: stdout.trim() || "(background process started)", isError: false };
       }
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = new TextDecoder().decode(value);
-        stdout += chunk;
-        for (const line of chunk.split("\n").filter((l) => l.trim()).slice(0, 3)) {
-          process.stdout.write(`${S.muted}  │ ${line}${S.reset}\n`);
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = new TextDecoder().decode(value);
+          stdout += chunk;
+          for (const line of chunk.split("\n").filter((l) => l.trim()).slice(0, 3)) {
+            process.stdout.write(`${S.muted}  │ ${line}${S.reset}\n`);
+          }
         }
+      } catch (e: any) {
+        if (timer) clearTimeout(timer);
+        return timeoutError(`bash: ${cmd}`, ms, "The command may be stuck in interactive mode or waiting for input.");
       }
 
       const stderr = await new Response(proc.stderr).text();
       if (timer) clearTimeout(timer);
       const exitCode = await proc.exited;
-      const ok = exitCode === 0;
 
+      if (timedOut) {
+        return timeoutError(`bash: ${cmd}`, ms, "The command may be stuck in interactive mode or waiting for input.");
+      }
+
+      const ok = exitCode === 0;
       process.stdout.write(`  ${ok ? `${S.success}✓` : `${S.error}✗`}${S.reset}  exit ${exitCode}\n`);
       return { content: [stdout, stderr].filter(Boolean).join("\n").trim() || "(no output)", isError: !ok };
     },
@@ -467,7 +590,7 @@ export const TOOLS: Tool[] = [
       "Run fallow codebase intelligence on the current project. " +
       "Requires fallow to be installed (bun add -d fallow) or available via bunx. " +
       "Commands: summary (overview), dead-code, dupes, health, audit (changed files), fix (cleanup). " +
-      "Always prefer --format json.",
+      "Always prefer --format json. Optional timeout (default 120s).",
     parameters: {
       type: "object",
       properties: {
@@ -480,21 +603,29 @@ export const TOOLS: Tool[] = [
           type: "string",
           description: "Additional flags, e.g. --dry-run",
         },
+        timeout: { type: "number", description: "Timeout in seconds (default 120)" },
       },
       required: ["command"],
     },
     async execute(args) {
       const cmd = String(args.command);
       const extra = args.extra ? ` ${String(args.extra)}` : "";
-      const proc = Bun.spawn(
-        ["bash", "-c", `bunx fallow ${cmd} --format json${extra}`],
-        { stdout: "pipe", stderr: "pipe" }
-      );
-      const stdout = await new Response(proc.stdout).text();
-      const stderr = await new Response(proc.stderr).text();
-      const exit = await proc.exited;
-      const out = stdout || stderr || "(no output)";
-      return { content: out.slice(0, 8000), isError: exit !== 0 };
+      const ms = getTimeoutMs(args, 120_000);
+      try {
+        const proc = Bun.spawn(
+          ["bash", "-c", `bunx fallow ${cmd} --format json${extra}`],
+          { stdout: "pipe", stderr: "pipe" }
+        );
+        const timer = setTimeout(() => proc.kill(), ms);
+        const stdout = await new Response(proc.stdout).text();
+        const stderr = await new Response(proc.stderr).text();
+        const exit = await proc.exited;
+        clearTimeout(timer);
+        const out = stdout || stderr || "(no output)";
+        return { content: out.slice(0, 8000), isError: exit !== 0 };
+      } catch (e: any) {
+        return timeoutError(`fallow ${cmd}`, ms, "Fallow may be scanning a very large codebase.");
+      }
     },
   },
 ];
@@ -607,7 +738,7 @@ export async function* parseSSE(stream: ReadableStream<Uint8Array>): AsyncGenera
 
 export async function* streamChat(messages: Message[], tools: Tool[], signal?: AbortSignal): AsyncGenerator<StreamChunk> {
   const cfg = getConfig();
-  const res = await fetch(`${cfg.apiBase}/chat/completions`, {
+  const res = await fetchWithTimeout(`${cfg.apiBase}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -619,7 +750,7 @@ export async function* streamChat(messages: Message[], tools: Tool[], signal?: A
       stream: true,
     }),
     signal,
-  });
+  }, STREAM_TIMEOUT_MS);
 
   if (!res.ok) throw new Error(`API ${res.status}: ${(await res.text()).slice(0, 200)}`);
   yield* parseSSE(res.body!);
@@ -653,11 +784,11 @@ export async function compactSession(messages: Message[]): Promise<Message[]> {
 
   const cfg = getConfig();
   const body: any = { model: cfg.model, messages: formatMessagesForAPI([summaryPrompt]), max_tokens: 500 };
-  const res = await fetch(`${cfg.apiBase}/chat/completions`, {
+  const res = await fetchWithTimeout(`${cfg.apiBase}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }, COMPACT_TIMEOUT_MS);
 
   const summary = (await res.json()).choices?.[0]?.message?.content || "Previous conversation context.";
   return [{ role: "user", content: `[Context]: ${summary}` }, ...recent];
@@ -708,6 +839,11 @@ export async function saveHistory(history: string[]): Promise<void> {
 //    2. If tool calls: execute them in parallel, append results
 //    3. Repeat from 1 with tool results in context
 //    4. If no tool calls: flush renderer, append assistant msg, done
+//  Safety rails:
+//    - Max 20 tool calls per turn to prevent infinite loops.
+//    - 5-minute overall turn timeout.
+//    - Individual tool timeouts defined by AI or defaulted.
+//    - Timeout errors are returned to the AI for re-evaluation.
 // ──────────────────────────────────────────────────────────────
 
 async function executeTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
@@ -719,8 +855,28 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
 
 export async function runTurn(messages: Message[]): Promise<{ inputTokens: number; outputTokens: number; cost: number }> {
   let totalOutputTokens = 0;
+  let toolCallCount = 0;
+  const turnStart = Date.now();
 
   while (true) {
+    // Overall turn timeout guard
+    if (Date.now() - turnStart > TURN_TIMEOUT_MS) {
+      messages.push({
+        role: "assistant",
+        content: "Turn aborted: total execution time exceeded 5 minutes. Please break your request into smaller steps.",
+      });
+      return { inputTokens: estimateTotalTokens(messages), outputTokens: totalOutputTokens, cost: calcCost(getConfig().model, estimateTotalTokens(messages), totalOutputTokens) };
+    }
+
+    // Infinite-loop guard
+    if (toolCallCount >= MAX_TOOL_CALLS_PER_TURN) {
+      messages.push({
+        role: "assistant",
+        content: `Turn aborted: reached the maximum of ${MAX_TOOL_CALLS_PER_TURN} tool calls in a single turn. Please consolidate your work or break it into multiple turns.`,
+      });
+      return { inputTokens: estimateTotalTokens(messages), outputTokens: totalOutputTokens, cost: calcCost(getConfig().model, estimateTotalTokens(messages), totalOutputTokens) };
+    }
+
     const inputTokens = estimateTotalTokens(messages);
     let assistantText = "";
     let outputTokens = 0;
@@ -744,6 +900,7 @@ export async function runTurn(messages: Message[]): Promise<{ inputTokens: numbe
         } else if (chunk.type === "tool_calls") {
           renderer.flush();
           gotToolCalls = true;
+          toolCallCount += chunk.calls.length;
 
           const assistantMsg: Message = { role: "assistant", content: assistantText, toolCalls: chunk.calls };
           if (reasoningText) assistantMsg.reasoning_content = reasoningText;
@@ -811,7 +968,7 @@ async function main() {
   let messages: Message[] = [
     {
       role: "system",
-      content: `cwd: ${process.cwd()}\ntools: read write edit bash fallow\n\nRules:\n- Be concise. Skip grammar.\n- Format in markdown.\n- Code blocks with \`\`\`.\n- Bold with **text**.\n- Inline code with \`code\`.\n- Bullets with - item.\n- Sections with # / ##.\n- Use fallow before large refactors to understand dead code, duplication, and complexity.\n- Use fallow audit after changes to catch regressions.`,
+      content: `cwd: ${process.cwd()}\ntools: read write edit bash fallow\n\nRules:\n- Be concise. Skip grammar.\n- Format in markdown.\n- Code blocks with \`\`\`.\n- Bold with **text**.\n- Inline code with \`code\`.\n- Bullets with - item.\n- Sections with # / ##.\n- Every tool accepts an optional \`timeout\` arg (seconds, default varies). If an operation might be slow, set an explicit timeout.\n- If a tool times out, re-evaluate: use a shorter command, run in background with '&', break the task into smaller steps, or request a higher timeout.\n- Use fallow before large refactors to understand dead code, duplication, and complexity.\n- Use fallow audit after changes to catch regressions.`,
     },
   ];
   let pendingImages: string[] = [];
