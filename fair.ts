@@ -69,6 +69,7 @@ function isReasoningModel(model: string): boolean {
     id.startsWith("o3") ||
     id.startsWith("o4") ||
     id.includes("reasoning") ||
+    id.includes("reasoner") ||
     id.includes("-think-")
   );
 }
@@ -528,13 +529,8 @@ export function formatMessagesForAPI(messages: Message[]): unknown[] {
       // Empty string is the safe default for all cases.
       base.content = m.content ?? "";
 
-      if (m.reasoning_content !== undefined) base.reasoning_content = m.reasoning_content;
-
-      // Some reasoning-model providers require reasoning_content field to be present
-      // even when empty (e.g. DeepSeek, some OpenAI-compatible proxies).
-      if (reasoning && base.reasoning_content === undefined) {
-        base.reasoning_content = "";
-      }
+      // NOTE: reasoning_content is kept internally but NEVER sent back to the API.
+      // Some providers (e.g. DeepSeek) return 400 if reasoning_content is echoed.
 
       if (m.toolCalls?.length) {
         base.tool_calls = m.toolCalls.map((tc) => ({
@@ -613,7 +609,9 @@ export async function* streamChat(messages: Message[], tools: Tool[], signal?: A
     body: JSON.stringify({
       model: cfg.model,
       messages: formatMessagesForAPI(messages),
-      tools: tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })),
+      ...(isReasoningModel(cfg.model) ? {} : {
+        tools: tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })),
+      }),
       stream: true,
     }),
     signal,
@@ -650,13 +648,7 @@ export async function compactSession(messages: Message[]): Promise<Message[]> {
   };
 
   const cfg = getConfig();
-  const body: any = { model: cfg.model, messages: formatMessagesForAPI([summaryPrompt]) };
-  // Reasoning models use max_completion_tokens instead of max_tokens
-  if (isReasoningModel(cfg.model)) {
-    body.max_completion_tokens = 500;
-  } else {
-    body.max_tokens = 500;
-  }
+  const body: any = { model: cfg.model, messages: formatMessagesForAPI([summaryPrompt]), max_tokens: 500 };
   const res = await fetch(`${cfg.apiBase}/chat/completions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${cfg.apiKey}`, "Content-Type": "application/json" },
